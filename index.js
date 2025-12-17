@@ -67,6 +67,7 @@ async function run() {
     const booksCollection = db.collection("books");
     const userCollection = db.collection("user");
     const orderCollection = db.collection("orders");
+    const paymentCollection = db.collection("payments");
 
     // Indexes
     await userCollection.createIndex({ email: 1 });
@@ -93,6 +94,39 @@ async function run() {
       const result = await booksCollection.findOne({ _id: new ObjectId(id) });
       res.send(result || { message: "Book not found" });
     });
+    app.get("/books/user/:email", async (req, res) => {
+      const email = req.params.email;
+      const books = await booksCollection
+        .find({ "user.email": email })
+        .toArray();
+      console.log(books);
+      res.send(books);
+    });
+    // PATCH /books/:id - update book fields
+    app.patch("/books/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const updateData = req.body; // { name, author, image, category, price }
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid book ID" });
+        }
+
+        const result = await booksCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).send({ message: "Book not found" });
+        }
+
+        res.send({ success: true, message: "Book updated successfully" });
+      } catch (err) {
+        console.error("Update book error:", err);
+        res.status(500).send({ error: err.message });
+      }
+    });
 
     app.post("/user", async (req, res) => {
       const userData = req.body;
@@ -112,7 +146,30 @@ async function run() {
       const result = await userCollection.insertOne(userData);
       res.send(result);
     });
+    // Get all users
+    app.get("/dashboard/all-user", async (req, res) => {
+      try {
+        const users = await userCollection.find().toArray();
+        console.log("Fetched users from DB:", users); // <-- check this log
+        res.send(users);
+      } catch (err) {
+        console.error(err);
+        res.status(500).send({ error: err.message });
+      }
+    });
 
+    // Delete a user
+    app.delete("/dashboard/user/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const result = await userCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ error: err.message });
+      }
+    });
     // My Orders
     app.get("/my-order/:email", async (req, res) => {
       console.log(req.params.email);
@@ -206,6 +263,45 @@ async function run() {
       res.send({ url: session.url });
     });
 
+    // app.patch("/dashboard/payment-success", async (req, res) => {
+    //   try {
+    //     const sessionId = req.query.session_id;
+
+    //     if (!sessionId) {
+    //       return res.status(400).json({ message: "Session ID missing" });
+    //     }
+
+    //     // 🔹 Retrieve Stripe session
+    //     const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    //     // 🔹 Check payment status
+    //     if (session.payment_status !== "paid") {
+    //       return res.status(400).json({ message: "Payment not completed" });
+    //     }
+
+    //     // 🔹 Update order in DB
+    //     const result = await orderCollection.updateOne(
+    //       { sessionId },
+    //       {
+    //         $set: {
+    //           status: "paid",
+    //           transactionId: session.payment_intent,
+    //           paidAt: new Date(),
+    //         },
+    //       }
+    //     );
+
+    //     res.send({
+    //       success: true,
+    //       transactionId: session.payment_intent,
+    //       message: "Payment verified successfully",
+    //     });
+    //   } catch (error) {
+    //     console.error(error);
+    //     res.status(500).json({ message: "Payment verification failed" });
+    //   }
+    // });
+
     // My Inventory
     // app.get("/my-inventory/:email", async (req, res) => {
     //   const result = await booksCollection
@@ -215,6 +311,77 @@ async function run() {
     // });
 
     // User Role
+
+    app.patch("/dashboard/payment-success", async (req, res) => {
+      try {
+        const sessionId = req.query.session_id;
+        if (!sessionId) {
+          return res.status(400).json({ message: "Session ID missing" });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        const transactionId = session.payment_intent;
+
+        // check if payment already exists
+        const paymentExist = await paymentCollection.findOne({ transactionId });
+        if (paymentExist) {
+          return res.send({
+            message: "Payment already exists",
+            transactionId,
+          });
+        }
+
+        console.log("payment status", session.payment_status);
+
+        if (session.payment_status === "paid") {
+          const bookId = session.metadata.bookId;
+          const query = { bookId };
+          // console.log("bookid", bookId);
+          // update order in DB
+          const update = {
+            $set: {
+              status: "paid",
+              paymentStatus: "paid",
+              transactionId,
+            },
+          };
+
+          const result = await orderCollection.updateOne(query, update);
+          // console.log("result", result);
+          // create payment record
+          const payment = {
+            amount: session.amount_total / 100,
+            currency: session.currency,
+            customerEmail: session.customer_email,
+            bookId: bookId,
+            bookName: session.metadata.bookName || "", // ensure this is passed in Stripe metadata
+            transactionId,
+            paymentStatus: session.payment_status,
+            paidAt: new Date(),
+          };
+
+          const resultPayment = await paymentCollection.insertOne(payment);
+
+          return res.send({
+            success: true,
+            modifiedOrder: result,
+            transactionId,
+            paymentInfo: resultPayment,
+          });
+        }
+
+        return res.send({ success: false });
+      } catch (error) {
+        console.error("Payment Success Error:", error);
+        res.status(500).json({ message: "Payment verification failed" });
+      }
+    });
+    app.get("/dashboard/invoice", async (req, res) => {
+      const result = await paymentCollection.find().toArray();
+      console.log(result);
+      res.send(result);
+    });
+
     app.get("/user/role/:email", async (req, res) => {
       const user = await userCollection.findOne({ email: req.params.email });
       res.send({ role: user?.role || "user" });
