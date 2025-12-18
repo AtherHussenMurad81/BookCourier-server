@@ -26,29 +26,20 @@ app.use(
 );
 app.use(express.json());
 
-// JWT Verification
+// jwt middlewares
 const verifyJWT = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).send({ message: "Unauthorized Access!" });
-  }
-  const token = authHeader.split(" ")[1];
+  const token = req?.headers?.authorization?.split(" ")[1];
+  console.log(token);
+  if (!token) return res.status(401).send({ message: "Unauthorized Access!" });
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.tokenEmail = decoded.email;
+    console.log(decoded);
     next();
   } catch (err) {
-    return res.status(401).send({ message: "Unauthorized Access!" });
+    console.log(err);
+    return res.status(401).send({ message: "Unauthorized Access!", err });
   }
-};
-
-const verifyUser = (req, res, next) => {
-  verifyJWT(req, res, () => {
-    if (req.tokenEmail !== req.params.email) {
-      return res.status(403).send({ message: "Forbidden Access!" });
-    }
-    next();
-  });
 };
 
 // MongoDB Client
@@ -68,11 +59,34 @@ async function run() {
     const userCollection = db.collection("user");
     const orderCollection = db.collection("orders");
     const paymentCollection = db.collection("payments");
+    const sellerRequestsCollection = db.collection("sellerRequests");
+    const wishlistCollection = db.collection("wishlist");
 
     // Indexes
     await userCollection.createIndex({ email: 1 });
 
     // ==================== ALL ROUTES GO HERE ====================
+    // role middlewares
+    const verifyADMIN = async (req, res, next) => {
+      const email = req.tokenEmail;
+      const user = await userCollection.findOne({ email });
+      if (user?.role !== "admin")
+        return res
+          .status(403)
+          .send({ message: "Admin only Actions!", role: user?.role });
+
+      next();
+    };
+    const verifyLibrarian = async (req, res, next) => {
+      const email = req.tokenEmail;
+      const user = await userCollection.findOne({ email });
+      if (user?.role !== "Librarian")
+        return res
+          .status(403)
+          .send({ message: "Librarian only Actions!", role: user?.role });
+
+      next();
+    };
 
     app.post("/books", async (req, res) => {
       const bookData = req.body;
@@ -83,9 +97,47 @@ async function run() {
     });
 
     app.get("/books", async (req, res) => {
-      const result = await booksCollection.find().toArray();
+      const result = await booksCollection
+        .find()
+        .sort({ price: "asc" })
+        .toArray();
       res.send(result);
     });
+    // app.get("/fiveBooks", async (req, res) => {
+    //   const result = await booksCollection
+    //     .find()
+    //     .sort({ price: "asc" })
+    //     .limit(5)
+    //     .toArray();
+    //   res.send(result);
+    // });
+
+    app.get("/search", async (req, res) => {
+      try {
+        const search_text = req.query.search || "";
+        const result = await booksCollection
+          .find({ title: { $regex: search_text, $options: "i" } })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Server Error" });
+      }
+    });
+    app.get(
+      "/dashboard/manage-books",
+
+      async (req, res) => {
+        const books = await booksCollection
+          .find()
+          .sort({
+            price: "asc",
+          })
+          .toArray();
+        // console.log(books);
+        res.send(books);
+      }
+    );
 
     app.get("/books/:id", async (req, res) => {
       const id = req.params.id;
@@ -146,6 +198,27 @@ async function run() {
       const result = await userCollection.insertOne(userData);
       res.send(result);
     });
+    app.get("/user", verifyJWT, async (req, res) => {
+      const result = await userCollection.find().toArray();
+      res.send(result);
+    });
+    // update a user's role
+    app.patch("/update-role", verifyJWT, verifyADMIN, async (req, res) => {
+      const { email, role } = req.body;
+      console.log("body", req.body);
+      const result = await userCollection.updateOne(
+        { email },
+        { $set: { role } }
+      );
+      await sellerRequestsCollection.deleteOne({ email });
+
+      res.send(result);
+    });
+    // get a user's role
+    app.get("/user/role", verifyJWT, async (req, res) => {
+      const result = await userCollection.findOne({ email: req.tokenEmail });
+      res.send({ role: result?.role });
+    });
     // Get all users
     app.get("/dashboard/all-user", async (req, res) => {
       try {
@@ -155,6 +228,25 @@ async function run() {
       } catch (err) {
         console.error(err);
         res.status(500).send({ error: err.message });
+      }
+    });
+    app.patch("/dashboard/user/role/:id", async (req, res) => {
+      const { id } = req.params;
+      const { role } = req.body;
+
+      if (!["admin", "librarian"].includes(role)) {
+        return res.status(400).send({ message: "Invalid role" });
+      }
+
+      try {
+        const result = await userCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { role } }
+        );
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to update role" });
       }
     });
 
@@ -181,7 +273,7 @@ async function run() {
       res.send(result);
     });
     // Place Order
-    app.post("/orders", async (req, res) => {
+    app.post("/orders", verifyJWT, async (req, res) => {
       const {
         bookId,
         price,
@@ -196,10 +288,10 @@ async function run() {
       }
 
       const book = await booksCollection.findOne({ _id: new ObjectId(bookId) });
-      console.log("book data", book);
+      // console.log("book data", book);
       if (!book) return res.status(404).send({ message: "Book not found" });
-      if (book.quantity < 1)
-        return res.status(400).send({ message: "Out of stock" });
+      // if (book.quantity < 1)
+      //   return res.status(400).send({ message: "Out of stock" });
 
       const newOrder = {
         bookId,
@@ -385,6 +477,45 @@ async function run() {
     app.get("/user/role/:email", async (req, res) => {
       const user = await userCollection.findOne({ email: req.params.email });
       res.send({ role: user?.role || "user" });
+    });
+    // POST /wishlist
+    app.post("/wishlist", verifyJWT, async (req, res) => {
+      const { bookId, userEmail, bookImg, price, name } = req.body;
+      console.log("wishlist", req.body);
+      if (!bookId || !userEmail) {
+        return res
+          .status(400)
+          .send({ message: "bookId and userEmail required" });
+      }
+
+      try {
+        const existing = await wishlistCollection.findOne({
+          bookId,
+          userEmail,
+          bookImg,
+          price,
+          name,
+        });
+        if (existing) {
+          return res.status(400).send({ message: "Book already in wishlist" });
+        }
+
+        const result = await wishlistCollection.insertOne({
+          bookId,
+          userEmail,
+          bookImg,
+          price,
+          name,
+        });
+        res.send({ success: true, data: result });
+      } catch (error) {
+        console.error(error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+    app.get("/wishlist", async (req, res) => {
+      const result = await wishlistCollection.find().toArray();
+      res.send(result);
     });
 
     // Root Route
